@@ -1,0 +1,16 @@
+# FFmpeg folder
+ffmpeg*/
+
+# Audio files
+*.mp3
+*.wav
+*.m4a
+
+# Python virtual environment
+.venv/
+__pycache__/
+*.pyc
+
+# IDE settings
+.vscode/
+.idea/
