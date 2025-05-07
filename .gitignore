@@ -6,6 +6,12 @@ ffmpeg*/
 *.wav
 *.m4a
 
+# Output files
+output/
+
+# Environment variables
+.env
+
 # Python virtual environment
 .venv/
 __pycache__/
