@@ -7,6 +7,7 @@ import torch
 import os
 import sys
 import shutil
+import noisereduce as nr
 
 # Set ffmpeg path
 ffmpeg_path = r"C:\Users\ianfe\OneDrive\Documents\GitHub\audioWhisper\ffmpeg-2025-05-05-git-f4e72eb5a3-full_build\ffmpeg-2025-05-05-git-f4e72eb5a3-full_build\bin"
@@ -182,6 +183,9 @@ class TranscriptionApp:
             if max_duration > 0:
                 samples = int(max_duration * sr)
                 audio = audio[:samples]
+            # Apply noise reduction
+            self.update_status("Applying noise reduction...")
+            audio = nr.reduce_noise(y=audio, sr=sr)
             duration = len(audio) / sr
 
             # Prepare temp_chunks directory
@@ -237,7 +241,7 @@ class TranscriptionApp:
                         segments.append({
                             "start": segment_start,
                             "end": segment_end,
-                            "text": seg["text"].strip(),
+                            "text": self.postprocess_text(seg["text"]),
                             "speaker": "UNKNOWN"
                         })
                     self.progress['value'] = 20 + int(30 * (i + 1) / max(1, len(speech_segments)))
@@ -250,15 +254,22 @@ class TranscriptionApp:
             self.progress['value'] = 50
             self.root.update()
 
-            # Diarization (still on full audio)
-            self.update_status("Running speaker diarization with pyannote.audio...")
+            # Diarization (still on full audio, with overlap handling)
+            self.update_status("Running speaker diarization with pyannote.audio (overlap enabled)...")
             temp_wav = os.path.join(os.path.dirname(file_path), "temp_for_transcribe.wav")
             sf.write(temp_wav, audio, sr)
             diarization_pipeline = PyannotePipeline.from_pretrained(
                 "pyannote/speaker-diarization",
                 use_auth_token=HF_TOKEN
             )
-            diarization = diarization_pipeline(temp_wav, num_speakers=num_speakers)
+            if diarization_pipeline is None:
+                raise RuntimeError("Failed to load pyannote diarization pipeline.")
+            if torch.cuda.is_available():
+                diarization_pipeline.to(torch.device("cuda"))
+            diarization = diarization_pipeline(
+                temp_wav,
+                num_speakers=num_speakers
+            )
             self.progress['value'] = 80
             self.root.update()
 
@@ -349,6 +360,17 @@ class TranscriptionApp:
         minutes = int(seconds // 60)
         secs = int(seconds % 60)
         return f"{minutes:02d}:{secs:02d}"
+
+    def postprocess_text(self, text: str) -> str:
+        text = text.strip()
+        if not text:
+            return text
+        # Capitalize first letter
+        text = text[0].upper() + text[1:]
+        # Add period if missing
+        if text[-1] not in '.!?':
+            text += '.'
+        return text
 
 if __name__ == "__main__":
     root = tk.Tk()
