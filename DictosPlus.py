@@ -218,6 +218,12 @@ class TranscriptionApp:
 
             max_chunk_sec = 30
             segments = []
+            
+            # Process chunks in batches
+            batch_size = 4  # Adjust based on your GPU memory
+            chunk_batches = []
+            current_batch = []
+            
             for i, (seg_start, seg_end) in enumerate(speech_segments):
                 # Split long segments into 30s sub-chunks
                 chunk_starts = np.arange(seg_start, seg_end, max_chunk_sec)
@@ -227,14 +233,34 @@ class TranscriptionApp:
                     end_sample = int(chunk_end * sr)
                     chunk_audio = audio[start_sample:end_sample]
                     if len(chunk_audio) == 0:
-                        continue  # skip empty chunks
+                        continue
                     temp_chunk_wav = os.path.join(temp_chunks_dir, f"vad_chunk_{i}_{j}.wav")
                     sf.write(temp_chunk_wav, chunk_audio, sr, format='WAV')
-                    self.update_status(f"Transcribing VAD chunk {i+1}/{len(speech_segments)} subchunk {j+1}/{len(chunk_starts)}...")
-                    chunk_call_kwargs = {}
-                    if selected_lang_code != "auto":
-                        chunk_call_kwargs["generate_kwargs"] = {"language": selected_lang_code}
-                    chunk_result = asr_pipe(temp_chunk_wav, **chunk_call_kwargs)
+                    current_batch.append((temp_chunk_wav, chunk_start, chunk_end))
+                    
+                    if len(current_batch) >= batch_size:
+                        chunk_batches.append(current_batch)
+                        current_batch = []
+            
+            if current_batch:  # Add any remaining chunks
+                chunk_batches.append(current_batch)
+
+            # Process batches
+            for batch_idx, batch in enumerate(chunk_batches):
+                self.update_status(f"Processing batch {batch_idx + 1}/{len(chunk_batches)}...")
+                chunk_paths = [chunk[0] for chunk in batch]
+                chunk_starts = [chunk[1] for chunk in batch]
+                chunk_ends = [chunk[2] for chunk in batch]
+                
+                # Batch process with Whisper
+                chunk_call_kwargs = {}
+                if selected_lang_code != "auto":
+                    chunk_call_kwargs["generate_kwargs"] = {"language": selected_lang_code}
+                
+                batch_results = asr_pipe(chunk_paths, **chunk_call_kwargs)
+                
+                # Process results
+                for chunk_result, chunk_start, chunk_end in zip(batch_results, chunk_starts, chunk_ends):
                     self.update_status(f"Debug - Chunk result: {chunk_result}")
                     
                     # Handle both single-text results and segmented results
@@ -281,10 +307,9 @@ class TranscriptionApp:
                             "speaker": "UNKNOWN"
                         })
                         self.update_status(f"Debug - Added single-text segment: start={chunk_start}, end={chunk_end}")
-                    
-                    self.progress['value'] = 20 + int(30 * (i + 1) / max(1, len(speech_segments)))
-                    self.root.update()
-                    # temp files will be deleted after all chunks are processed
+                
+                self.progress['value'] = 20 + int(30 * (batch_idx + 1) / max(1, len(chunk_batches)))
+                self.root.update()
 
             # Clean up temp_chunks directory
             shutil.rmtree(temp_chunks_dir, ignore_errors=True)
@@ -292,75 +317,22 @@ class TranscriptionApp:
             self.progress['value'] = 50
             self.root.update()
 
-            # Diarization (still on full audio, with overlap handling)
-            self.update_status("Running speaker diarization with pyannote.audio (overlap enabled)...")
-            temp_wav = os.path.join(os.path.dirname(file_path), "temp_for_transcribe.wav")
-            sf.write(temp_wav, audio, sr)
-            diarization_pipeline = PyannotePipeline.from_pretrained(
-                "pyannote/speaker-diarization",
-                use_auth_token=HF_TOKEN
-            )
-            if diarization_pipeline is None:
-                raise RuntimeError("Failed to load pyannote diarization pipeline.")
-            if torch.cuda.is_available():
-                diarization_pipeline.to(torch.device("cuda"))
-            diarization = diarization_pipeline(
-                temp_wav,
-                num_speakers=num_speakers
-            )
-            self.progress['value'] = 80
-            self.root.update()
-
-            # Assign speakers to segments
-            speaker_segments = {}
-            for turn in diarization.itertracks(yield_label=True):
-                segment, _, speaker = turn
-                if speaker not in speaker_segments:
-                    speaker_segments[speaker] = []
-                speaker_segments[speaker].append({"start": segment.start, "end": segment.end})
-
-            for seg in segments:
-                seg_start = seg["start"]
-                seg_end = seg["end"]
-                seg["speaker"] = "UNKNOWN"
-                for speaker, segs in speaker_segments.items():
-                    for diar_seg in segs:
-                        if seg_start >= diar_seg["start"] and seg_end <= diar_seg["end"]:
-                            seg["speaker"] = speaker
-                            break
-                    if seg["speaker"] != "UNKNOWN":
-                        break
-
-            self.progress['value'] = 90
-            self.root.update()
-
-            # Deduplicate repeated words at chunk boundaries
-            deduped_segments = []
-            for i, seg in enumerate(segments):
-                if i > 0:
-                    prev_seg = deduped_segments[-1]
-                    # Check if text matches and timestamps are close (within 2 seconds)
-                    if (
-                        seg["text"].strip().lower() == prev_seg["text"].strip().lower() and
-                        abs(seg["start"] - prev_seg["end"]) < 2
-                    ):
-                        continue  # skip duplicate
-                deduped_segments.append(seg)
-            segments = deduped_segments
-
-            # Speaker embedding re-clustering
+            # Batch process speaker embeddings
             self.update_status("Extracting speaker embeddings and re-clustering...")
             embedding_model = EmbeddingInference("pyannote/embedding", use_auth_token=HF_TOKEN, device=torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
             if getattr(embedding_model, 'model', None) is None:
                 raise RuntimeError("Failed to load pyannote speaker embedding model.")
-            segment_embeddings = []
-            segment_times = []
+            
+            # Prepare batches for embedding extraction
+            embedding_batch_size = 8  # Adjust based on your GPU memory
             min_duration = 0.01  # seconds (lowered threshold)
+            segment_batches = []
+            current_batch = []
+            
             for seg in segments:
                 start = seg["start"]
                 end = seg["end"]
                 duration = end - start
-                self.update_status(f"Segment: start={start:.2f}, end={end:.2f}, duration={duration:.2f}")
                 if duration < min_duration:
                     continue
                 start_idx = int(start * sr)
@@ -370,26 +342,53 @@ class TranscriptionApp:
                 segment_audio = audio[start_idx:end_idx]
                 if len(segment_audio) == 0:
                     continue
-                # Convert to torch tensor with correct shape (channel, time)
-                segment_audio = torch.from_numpy(segment_audio).float()
-                if len(segment_audio.shape) == 1:
-                    segment_audio = segment_audio.unsqueeze(0)  # Add channel dimension
-                embedding_input = {"waveform": segment_audio, "sample_rate": sr}
-                try:
-                    emb = embedding_model(embedding_input)
-                    # Handle different types of embedding outputs
-                    if hasattr(emb, 'data'):  # SlidingWindowFeature
-                        emb = emb.data
-                    if isinstance(emb, torch.Tensor):
-                        emb = emb.cpu().numpy()
-                    # Take mean of embeddings if we have multiple
-                    if len(emb.shape) > 1:
-                        emb = np.mean(emb, axis=0)
-                    segment_embeddings.append(emb)
-                    segment_times.append((start, end))
-                except Exception as e:
-                    self.update_status(f"Warning: Could not extract embedding for segment {start:.2f}-{end:.2f}: {str(e)}")
-                    continue
+                current_batch.append((segment_audio, start, end))
+                
+                if len(current_batch) >= embedding_batch_size:
+                    segment_batches.append(current_batch)
+                    current_batch = []
+            
+            if current_batch:
+                segment_batches.append(current_batch)
+
+            # Process embedding batches
+            segment_embeddings = []
+            segment_times = []
+            
+            for batch_idx, batch in enumerate(segment_batches):
+                self.update_status(f"Processing embedding batch {batch_idx + 1}/{len(segment_batches)}...")
+                batch_embeddings = []
+                batch_times = []
+                
+                for segment_audio, start, end in batch:
+                    # Convert to torch tensor with correct shape (channel, time)
+                    segment_audio = torch.from_numpy(segment_audio).float()
+                    if len(segment_audio.shape) == 1:
+                        segment_audio = segment_audio.unsqueeze(0)
+                    
+                    embedding_input = {"waveform": segment_audio, "sample_rate": sr}
+                    try:
+                        emb = embedding_model(embedding_input)
+                        # Handle different types of embedding outputs
+                        if hasattr(emb, 'data'):  # SlidingWindowFeature
+                            emb = emb.data
+                        if isinstance(emb, torch.Tensor):
+                            emb = emb.cpu().numpy()
+                        # Take mean of embeddings if we have multiple
+                        if len(emb.shape) > 1:
+                            emb = np.mean(emb, axis=0)
+                        batch_embeddings.append(emb)
+                        batch_times.append((start, end))
+                    except Exception as e:
+                        self.update_status(f"Warning: Could not extract embedding for segment {start:.2f}-{end:.2f}: {str(e)}")
+                        continue
+                
+                if batch_embeddings:
+                    segment_embeddings.extend(batch_embeddings)
+                    segment_times.extend(batch_times)
+                
+                self.progress['value'] = 60 + int(20 * (batch_idx + 1) / max(1, len(segment_batches)))
+                self.root.update()
 
             if not segment_embeddings:
                 raise RuntimeError("No valid segments for speaker embedding extraction.")
@@ -421,6 +420,18 @@ class TranscriptionApp:
                 for seg in segments:
                     if abs(seg["start"] - start) < 0.1 and abs(seg["end"] - end) < 0.1:
                         seg["speaker"] = f"SPEAKER_{label:02d}"
+
+            # Create speaker_segments dictionary for output
+            speaker_segments = {}
+            for seg in segments:
+                speaker = seg["speaker"]
+                if speaker not in speaker_segments:
+                    speaker_segments[speaker] = []
+                speaker_segments[speaker].append({
+                    "start": seg["start"],
+                    "end": seg["end"],
+                    "text": seg["text"]
+                })
 
             # Save output
             self.update_status("Saving transcription results...")
