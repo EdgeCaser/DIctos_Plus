@@ -14,9 +14,23 @@ output/
 
 # Python virtual environment
 .venv/
+.venv311/
+.venv312/
 __pycache__/
 *.pyc
 
 # IDE settings
 .vscode/
 .idea/
+
+# Additional virtual environments
+.venv311/
+
+# Temporary and cache directories
+temp/
+model_cache/
+
+# Model files and large binaries
+*.bin
+*.7z
+models/
