@@ -36,9 +36,10 @@ import numpy as np
 import soundfile as sf
 from datetime import datetime
 from transformers import pipeline
-from pyannote.audio import Pipeline as PyannotePipeline
+from pyannote.audio import Pipeline as PyannotePipeline, Inference as EmbeddingInference
 from dotenv import load_dotenv
 from pyannote.audio.pipelines import VoiceActivityDetection
+from sklearn.cluster import AgglomerativeClustering
 
 # Set device
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -234,16 +235,53 @@ class TranscriptionApp:
                     if selected_lang_code != "auto":
                         chunk_call_kwargs["generate_kwargs"] = {"language": selected_lang_code}
                     chunk_result = asr_pipe(temp_chunk_wav, **chunk_call_kwargs)
-                    for seg in chunk_result["segments"] if "segments" in chunk_result else [chunk_result]:
-                        seg_offset = chunk_start
-                        segment_start = seg.get("start", 0) + seg_offset
-                        segment_end = seg.get("end", 0) + seg_offset
+                    self.update_status(f"Debug - Chunk result: {chunk_result}")
+                    
+                    # Handle both single-text results and segmented results
+                    if "segments" in chunk_result:
+                        # Process segmented results
+                        for seg in chunk_result["segments"]:
+                            seg_offset = chunk_start
+                            seg_start = seg.get("start")
+                            seg_end = seg.get("end")
+                            
+                            self.update_status(f"Debug - Raw segment: start={seg_start}, end={seg_end}")
+                            
+                            # Always use chunk boundaries as fallback
+                            segment_start = chunk_start
+                            segment_end = chunk_end
+                            
+                            # Try to use Whisper timestamps if they're valid
+                            try:
+                                if seg_start is not None and seg_end is not None:
+                                    seg_start_float = float(seg_start)
+                                    seg_end_float = float(seg_end)
+                                    if seg_end_float > seg_start_float:
+                                        segment_start = seg_start_float + seg_offset
+                                        segment_end = seg_end_float + seg_offset
+                            except (ValueError, TypeError) as e:
+                                self.update_status(f"Debug - Error converting timestamps: {str(e)}")
+                                continue
+                                
+                            # Only add if duration is positive
+                            if segment_end > segment_start:
+                                segments.append({
+                                    "start": segment_start,
+                                    "end": segment_end,
+                                    "text": self.postprocess_text(seg["text"]),
+                                    "speaker": "UNKNOWN"
+                                })
+                                self.update_status(f"Debug - Added segment: start={segment_start}, end={segment_end}")
+                    else:
+                        # Handle single-text result
                         segments.append({
-                            "start": segment_start,
-                            "end": segment_end,
-                            "text": self.postprocess_text(seg["text"]),
+                            "start": chunk_start,
+                            "end": chunk_end,
+                            "text": self.postprocess_text(chunk_result["text"]),
                             "speaker": "UNKNOWN"
                         })
+                        self.update_status(f"Debug - Added single-text segment: start={chunk_start}, end={chunk_end}")
+                    
                     self.progress['value'] = 20 + int(30 * (i + 1) / max(1, len(speech_segments)))
                     self.root.update()
                     # temp files will be deleted after all chunks are processed
@@ -309,6 +347,80 @@ class TranscriptionApp:
                         continue  # skip duplicate
                 deduped_segments.append(seg)
             segments = deduped_segments
+
+            # Speaker embedding re-clustering
+            self.update_status("Extracting speaker embeddings and re-clustering...")
+            embedding_model = EmbeddingInference("pyannote/embedding", use_auth_token=HF_TOKEN, device=torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+            if getattr(embedding_model, 'model', None) is None:
+                raise RuntimeError("Failed to load pyannote speaker embedding model.")
+            segment_embeddings = []
+            segment_times = []
+            min_duration = 0.01  # seconds (lowered threshold)
+            for seg in segments:
+                start = seg["start"]
+                end = seg["end"]
+                duration = end - start
+                self.update_status(f"Segment: start={start:.2f}, end={end:.2f}, duration={duration:.2f}")
+                if duration < min_duration:
+                    continue
+                start_idx = int(start * sr)
+                end_idx = int(end * sr)
+                if end_idx <= start_idx:
+                    continue
+                segment_audio = audio[start_idx:end_idx]
+                if len(segment_audio) == 0:
+                    continue
+                # Convert to torch tensor with correct shape (channel, time)
+                segment_audio = torch.from_numpy(segment_audio).float()
+                if len(segment_audio.shape) == 1:
+                    segment_audio = segment_audio.unsqueeze(0)  # Add channel dimension
+                embedding_input = {"waveform": segment_audio, "sample_rate": sr}
+                try:
+                    emb = embedding_model(embedding_input)
+                    # Handle different types of embedding outputs
+                    if hasattr(emb, 'data'):  # SlidingWindowFeature
+                        emb = emb.data
+                    if isinstance(emb, torch.Tensor):
+                        emb = emb.cpu().numpy()
+                    # Take mean of embeddings if we have multiple
+                    if len(emb.shape) > 1:
+                        emb = np.mean(emb, axis=0)
+                    segment_embeddings.append(emb)
+                    segment_times.append((start, end))
+                except Exception as e:
+                    self.update_status(f"Warning: Could not extract embedding for segment {start:.2f}-{end:.2f}: {str(e)}")
+                    continue
+
+            if not segment_embeddings:
+                raise RuntimeError("No valid segments for speaker embedding extraction.")
+
+            # Ensure all embeddings have the same shape
+            embedding_shape = segment_embeddings[0].shape
+            valid_embeddings = []
+            valid_times = []
+            for emb, (start, end) in zip(segment_embeddings, segment_times):
+                if emb.shape == embedding_shape:
+                    valid_embeddings.append(emb)
+                    valid_times.append((start, end))
+                else:
+                    self.update_status(f"Warning: Skipping embedding with shape {emb.shape} (expected {embedding_shape})")
+
+            if not valid_embeddings:
+                raise RuntimeError("No valid embeddings after shape validation.")
+
+            # Stack embeddings
+            segment_embeddings = np.stack(valid_embeddings)
+            
+            # Cluster embeddings
+            n_speakers = num_speakers if num_speakers else len(set([seg["speaker"] for seg in segments]))
+            clustering = AgglomerativeClustering(n_clusters=n_speakers)
+            labels = clustering.fit_predict(segment_embeddings)
+            
+            # Relabel segments
+            for (start, end), label in zip(valid_times, labels):
+                for seg in segments:
+                    if abs(seg["start"] - start) < 0.1 and abs(seg["end"] - end) < 0.1:
+                        seg["speaker"] = f"SPEAKER_{label:02d}"
 
             # Save output
             self.update_status("Saving transcription results...")
