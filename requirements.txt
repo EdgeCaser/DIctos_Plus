@@ -1,12 +1,22 @@
-git+https://github.com/openai/whisper.git
+# Core dependencies
+torch>=2.0.1
+torchaudio>=2.0.1
+torchvision>=0.15.2
+
+# Audio processing
 ffmpeg-python>=0.2.0
-python-dotenv
-pyannote.audio>=3.0.0
-huggingface-hub
 pydub>=0.25.1
-soundfile
+soundfile>=0.13.1
+noisereduce>=3.0.0
+
+# AI Models and Processing
+git+https://github.com/openai/whisper.git
+pyannote.audio>=3.0.0
 whisperx==3.2.0
 ctranslate2>=4.0,<5
 faster-whisper
-noisereduce
-transformers
+transformers>=4.31.0
+
+# Utilities
+python-dotenv
+huggingface-hub
