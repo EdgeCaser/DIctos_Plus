@@ -10,7 +10,7 @@ import shutil
 import noisereduce as nr
 
 # Set ffmpeg path
-ffmpeg_path = r"C:\Users\ianfe\OneDrive\Documents\GitHub\audioWhisper\ffmpeg-2025-05-05-git-f4e72eb5a3-full_build\ffmpeg-2025-05-05-git-f4e72eb5a3-full_build\bin"
+ffmpeg_path = r"C:\Users\ianfe\OneDrive\Documents\GitHub\DictosPlus\ffmpeg-2025-05-05-git-f4e72eb5a3-full_build\ffmpeg-2025-05-05-git-f4e72eb5a3-full_build\bin"
 if not os.path.exists(ffmpeg_path):
     messagebox.showerror("Error", f"ffmpeg directory not found at: {ffmpeg_path}")
     sys.exit(1)
