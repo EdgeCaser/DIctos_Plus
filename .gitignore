@@ -34,3 +34,4 @@ model_cache/
 *.bin
 *.7z
 models/
+/venv

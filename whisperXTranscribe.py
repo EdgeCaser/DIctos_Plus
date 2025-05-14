@@ -256,31 +256,55 @@ class TranscriptionApp:
             self.root.update()
 
             # Load WhisperX model
-            self.update_status("Loading WhisperX model (small.en)...")
+            self.update_status("Loading WhisperX model (base.en)...")
             device = "cuda" if torch.cuda.is_available() else "cpu"
             start_time = time.time()
             
-            # Create ASR options dictionary
-            asr_options = {
-                "multilingual": False,
-                "max_new_tokens": max_new_tokens,
-                "clip_timestamps": clip_timestamps,
-                "hallucination_silence_threshold": hallucination_silence_threshold,
-                "hotwords": hotwords
-            }
-            
-            # Load model with correct parameters
-            model = whisperx.load_model(
-                "base.en",
-                device,
-                compute_type="float32",
-                asr_options=asr_options,
-                language="en"
-            )
-            
-            self.update_status(f"Model loaded in {time.time() - start_time:.2f} seconds")
-            self.progress['value'] = 30
-            self.root.update()
+            try:
+                # Create ASR options dictionary
+                asr_options = {
+                    "multilingual": False,
+                    "max_new_tokens": max_new_tokens,
+                    "clip_timestamps": clip_timestamps,
+                    "hallucination_silence_threshold": hallucination_silence_threshold,
+                    "hotwords": hotwords
+                }
+                
+                self.update_status("Attempting to download/load model...")
+                # Print cache directory for debugging
+                cache_dir = os.path.expanduser('~/.cache/whisperx')
+                self.update_status(f"Model cache directory: {cache_dir}")
+                self.update_status(f"Cache directory exists: {os.path.exists(cache_dir)}")
+                
+                # Load model with correct parameters and more detailed error handling
+                try:
+                    model = whisperx.load_model(
+                        "base.en",
+                        device,
+                        compute_type="float32",
+                        asr_options=asr_options,
+                        language="en",
+                        download_root=cache_dir  # Explicitly set download root
+                    )
+                except Exception as model_error:
+                    self.update_status(f"Detailed model loading error: {str(model_error)}")
+                    self.update_status("Attempting to load model with fallback options...")
+                    # Try with minimal options as fallback, but still provide asr_options
+                    model = whisperx.load_model(
+                        "base.en",
+                        device,
+                        compute_type="float32",
+                        asr_options=asr_options,
+                        language="en"
+                    )
+                
+                self.update_status(f"Model loaded in {time.time() - start_time:.2f} seconds")
+            except Exception as e:
+                self.update_status(f"Error during model loading: {str(e)}")
+                self.update_status("Full error details:")
+                import traceback
+                self.update_status(traceback.format_exc())
+                raise
 
             # Transcribe with diarization
             self.update_status("Transcribing and diarizing with WhisperX...")
