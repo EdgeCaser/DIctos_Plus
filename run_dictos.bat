@@ -15,10 +15,17 @@ if %ERRORLEVEL% NEQ 0 (
     exit /b 1
 )
 
-REM Clean up any existing virtual environment
+REM Check if virtual environment needs to be recreated
 if exist .venv (
-    echo Removing existing virtual environment...
-    rmdir /s /q .venv
+    echo Checking virtual environment...
+    .venv\Scripts\python.exe --version 2>nul | findstr "3.11" >nul
+    if %ERRORLEVEL% NEQ 0 (
+        echo Virtual environment has wrong Python version. Recreating...
+        rmdir /s /q .venv
+    ) else (
+        echo Virtual environment looks good. Proceeding...
+        goto :activate_venv
+    )
 )
 
 echo Creating fresh virtual environment...
@@ -29,6 +36,7 @@ if %ERRORLEVEL% NEQ 0 (
     exit /b 1
 )
 
+:activate_venv
 echo Activating virtual environment...
 call .venv\Scripts\activate.bat
 if %ERRORLEVEL% NEQ 0 (
